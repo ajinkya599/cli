@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
 	"github.com/cli/cli/v2/api"
+	"github.com/cli/cli/v2/internal/ghinstance"
+	"github.com/cli/cli/v2/internal/ghrepo"
 )
 
 // repoCreateInput is input parameters for the repoCreate method
@@ -58,6 +61,22 @@ type cloneTemplateRepositoryInput struct {
 	Description  string `json:"description,omitempty"`
 	OwnerID      string `json:"ownerId"`
 	RepositoryID string `json:"repositoryId"`
+}
+
+type createRepositoryFromStackInput struct {
+	Name                string                 `json:"name"`
+	Private             bool                   `json:"private"`
+	Description         string                 `json:"description,omitempty"`
+	OwnerLogin          string                 `json:"ownerLogin"`
+	StackOwnerLogin     string                 `json:"stackOwnerLogin"`
+	StackRepositoryName string                 `json:"stackRepositoryName"`
+	ReleaseTag          string                 `json:"releaseTag"`
+	Inputs              map[string]interface{} `json:"inputs"`
+}
+
+type stackData struct {
+	Inputs []map[string]interface{}
+	Apps   []map[string]interface{}
 }
 
 // repoCreate creates a new GitHub repository
@@ -199,6 +218,88 @@ func repoCreate(client *http.Client, hostname string, input repoCreateInput) (*a
 	}
 
 	return api.InitRepoHostname(&response.CreateRepository.Repository, hostname), nil
+}
+
+func listReleases(opts *CreateOptions, httpClient *http.Client, baseRepo ghrepo.Interface, hostname string) ([]string, error) {
+	url := fmt.Sprintf("%srepos/%s/%s/releases", ghinstance.RESTPrefix(hostname), baseRepo.RepoOwner(), baseRepo.RepoName())
+	// stdout := opts.IO.Out
+	// fmt.Fprintf(stdout, "GET releases call url: %s\n", url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	var releasesResponse []map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&releasesResponse)
+	releases := []string{}
+	for _, release := range releasesResponse {
+		// fmt.Fprintf(stdout, "Release tag: %s\n", release["tag_name"].(string))
+		releases = append(releases, release["tag_name"].(string))
+	}
+
+	return releases, nil
+}
+
+func getStackData(opts *CreateOptions, httpClient *http.Client, releaseTag string, baseRepo ghrepo.Interface, hostname string) (stackData, error) {
+	url := fmt.Sprintf("%srepos/%s/%s/stacks/data?release_tag=%s", ghinstance.RESTPrefix(hostname), baseRepo.RepoOwner(), baseRepo.RepoName(), releaseTag)
+	// stdout := opts.IO.Out
+	// fmt.Fprintf(stdout, "GET call url: %s\n", url)
+	var data stackData
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return data, err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return data, err
+	}
+
+	// var stackMetadata map[string][]map[string]string
+	var stackMetadata map[string][]map[string]interface{}
+	defer resp.Body.Close()
+	json.NewDecoder(resp.Body).Decode(&stackMetadata)
+	// fmt.Println("---\n---\n", stackMetadata)
+	data.Inputs = stackMetadata["inputs"]
+	data.Apps = stackMetadata["apps"]
+
+	return data, nil
+}
+
+func createRepoFromStack(opts *CreateOptions, httpClient *http.Client, baseRepo ghrepo.Interface, hostname string, input createRepositoryFromStackInput) (io.ReadCloser, error) {
+	url := fmt.Sprintf("%srepos/%s/%s/stacks", ghinstance.RESTPrefix(hostname), baseRepo.RepoOwner(), baseRepo.RepoName())
+	// stdout := opts.IO.Out
+	// fmt.Fprintf(stdout, "POST call url: %s\n", url)
+	payload := map[string]interface{}{
+		"owner":       input.OwnerLogin,
+		"name":        input.Name,
+		"release_tag": input.ReleaseTag,
+		"inputs":      input.Inputs,
+	}
+
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(payloadBytes))
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	return resp.Body, nil
 }
 
 type ownerResponse struct {
